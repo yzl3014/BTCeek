@@ -81,31 +81,9 @@ impl Scanner {
         
         // 输出到控制台（带颜色）
         println!("{}", console_message);
-
-        // 写入日志文件（无颜色）
-        if let Ok(mut file) = self.log_file.lock() {
-
-            println!("{}",log_message);
-            
-            let _ = writeln!(file, "{}", log_message);
-            
-            
-            // 检查是否需要刷新到磁盘
-            let should_flush = force_flush || {
-                if let Ok(last_flush) = self.last_log_flush.lock() {
-                    last_flush.elapsed() > Duration::from_secs(30)
-                } else {
-                    false
-                }
-            };
-            
-            if should_flush {
-                let _ = file.flush();
-                if let Ok(mut last_flush) = self.last_log_flush.lock() {
-                    *last_flush = Instant::now();
-                }
-            }
-        }
+        
+        // 写入日志文件（无颜色）- 使用超时避免死锁
+        self.try_log_to_file(&log_message, force_flush);
     }
 
     fn log_multiline(&self, title: &str, lines: &[&str], force_flush: bool) {
@@ -117,29 +95,18 @@ impl Scanner {
             println!("[{}]   {}", timestamp, line);
         }
         
-        // 写入日志文件（无颜色）
-        if let Ok(mut file) = self.log_file.lock() {
-            let _ = writeln!(file, "[{}] {}", timestamp, Self::strip_colors(title));
-            for line in lines {
-                let _ = writeln!(file, "[{}]   {}", timestamp, Self::strip_colors(line));
-            }
-            
-            // 检查是否需要刷新到磁盘
-            let should_flush = force_flush || {
-                if let Ok(last_flush) = self.last_log_flush.lock() {
-                    last_flush.elapsed() > Duration::from_secs(30)
-                } else {
-                    false
-                }
-            };
-            
-            if should_flush {
-                let _ = file.flush();
-                if let Ok(mut last_flush) = self.last_log_flush.lock() {
-                    *last_flush = Instant::now();
-                }
-            }
-        }
+        // 写入日志文件（无颜色）- 使用超时避免死锁
+        let full_message = format!(
+            "[{}] {}\n{}",
+            timestamp,
+            Self::strip_colors(title),
+            lines.iter()
+                .map(|line| format!("[{}]   {}", timestamp, Self::strip_colors(line)))
+                .collect::<Vec<String>>()
+                .join("\n")
+        );
+        
+        self.try_log_to_file(&full_message, force_flush);
     }
 
     fn log_progress(&self, message: &str) {
@@ -151,18 +118,43 @@ impl Scanner {
         print!("\r{}", console_message);
         let _ = std::io::stdout().flush();
         
-        // 写入日志文件（无颜色，带换行）- 但不强制刷新，等待30秒刷新
-        if let Ok(mut file) = self.log_file.lock() {
-            let _ = writeln!(file, "{}", log_message);
-            
-            // 检查是否需要刷新到磁盘
+        // 写入日志文件（无颜色，带换行）- 使用超时避免死锁
+        self.try_log_to_file(&log_message, false);
+    }
+
+    // 尝试写入日志文件，带超时机制
+    fn try_log_to_file(&self, message: &str, force_flush: bool) {
+        // 尝试获取锁，最多等待100毫秒
+        let log_file_lock = match self.log_file.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                // 如果获取锁失败，只输出到控制台
+                return;
+            }
+        };
+        
+        let mut file = log_file_lock;
+        
+        if let Err(e) = writeln!(file, "{}", message) {
+            eprintln!("写入日志失败: {}", e);
+            return;
+        }
+        
+        // 检查是否需要刷新到磁盘
+        let should_flush = force_flush || {
             if let Ok(last_flush) = self.last_log_flush.lock() {
-                if last_flush.elapsed() > Duration::from_secs(30) {
-                    let _ = file.flush();
-                    if let Ok(mut last_flush) = self.last_log_flush.lock() {
-                        *last_flush = Instant::now();
-                    }
-                }
+                last_flush.elapsed() > Duration::from_secs(30)
+            } else {
+                false
+            }
+        };
+        
+        if should_flush {
+            if let Err(e) = file.flush() {
+                eprintln!("刷新日志失败: {}", e);
+            }
+            if let Ok(mut last_flush) = self.last_log_flush.lock() {
+                *last_flush = Instant::now();
             }
         }
     }
@@ -220,7 +212,13 @@ impl Scanner {
                             );
                             self.log_message(&success_message, true); // 强制刷新日志
                             
-                            // 修复类型不匹配问题：创建字符串切片数组
+                            // 先设置找到的私钥，确保其他线程知道已找到
+                            {
+                                let mut found = self.found_key.lock().unwrap();
+                                *found = Some((private_key_hex.clone(), address.clone()));
+                            }
+                            
+                            // 然后记录详情
                             let line1 = format!("{}私钥 (HEX): {}{}", color::CYAN, private_key_hex, color::RESET);
                             let line2 = format!("{}私钥 (DEC): {}{}", color::CYAN, i, color::RESET);
                             let line3 = format!("{}比特币地址: {}{}", color::CYAN, address, color::RESET);
@@ -232,9 +230,6 @@ impl Scanner {
                             ];
                             
                             self.log_multiline("发现私钥详情:", &details, true); // 强制刷新日志
-                            
-                            let mut found = self.found_key.lock().unwrap();
-                            *found = Some((private_key_hex, address));
                             return;
                         }
                     }
@@ -277,14 +272,19 @@ impl Scanner {
                 match self.private_key_to_address(&private_key_hex) {
                     Ok(address) => {
                         if address == self.target_address {
-                            
                             let success_message = format!(
                                 "{}反向线程 {} 找到匹配的私钥!{}",
                                 color::GREEN, thread_id, color::RESET
                             );
                             self.log_message(&success_message, true); // 强制刷新日志
-
-                            // 修复类型不匹配问题：创建字符串切片数组
+                            
+                            // 先设置找到的私钥，确保其他线程知道已找到
+                            {
+                                let mut found = self.found_key.lock().unwrap();
+                                *found = Some((private_key_hex.clone(), address.clone()));
+                            }
+                            
+                            // 然后记录详情
                             let line1 = format!("{}私钥 (HEX): {}{}", color::CYAN, private_key_hex, color::RESET);
                             let line2 = format!("{}私钥 (DEC): {}{}", color::CYAN, i, color::RESET);
                             let line3 = format!("{}比特币地址: {}{}", color::CYAN, address, color::RESET);
@@ -294,11 +294,8 @@ impl Scanner {
                                 line2.as_str(),
                                 line3.as_str(),
                             ];
-
-                            self.log_multiline("发现私钥详情:", &details, true); // 强制刷新日志
                             
-                            let mut found = self.found_key.lock().unwrap();
-                            *found = Some((private_key_hex, address));
+                            self.log_multiline("发现私钥详情:", &details, true); // 强制刷新日志
                             return;
                         }
                     }
